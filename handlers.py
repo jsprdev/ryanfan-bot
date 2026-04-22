@@ -58,7 +58,8 @@ async def _safe_edit(query, text: str, reply_markup=None) -> None:
 # --- /start --------------------------------------------------------------------
 
 HELP_TEXT = (
-    "📚 *Study Accountability Bot*\n\n"
+    # "📚 *Study Accountability Bot*\n\n"
+    "I am the Ryan Fan Study Bot. I am here to supervise you until you stop slacking because I already finished watching 100 lectures and did 80 tutorials in the past 5 minutes you were scrolling tiktok.\n\n"
     "*Setup*\n"
     "• `/setmembers Alice, Bob, Charlie` — set the roster\n"
     "• `/setschedule <name>` + lines of `HH:MM Topic` — save a schedule preset\n"
