@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import random
 from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -18,6 +19,8 @@ import messages
 import scheduler
 
 log = logging.getLogger(__name__)
+
+SGT = ZoneInfo("Asia/Singapore")
 
 
 # --- config is injected by bot.py at startup -----------------------------------
@@ -60,7 +63,10 @@ async def _safe_edit(query, text: str, reply_markup=None) -> None:
 HELP_TEXT = (
     # "📚 *Study Accountability Bot*\n\n"
     "I am the Ryan Fan Study Bot. I am here to supervise you until you stop slacking because I already finished watching 100 lectures and did 80 tutorials in the past 5 minutes you were scrolling tiktok.\n\n"
-    "*Setup*\n"
+)
+
+""" USAGE HELP
+"*Setup*\n"
     "• `/setmembers Alice, Bob, Charlie` — set the roster\n"
     "• `/setschedule <name>` + lines of `HH:MM Topic` — save a schedule preset\n"
     "• `/load <name>` — load a saved preset\n"
@@ -71,8 +77,7 @@ HELP_TEXT = (
     "• `/session` — start today's plan (reminders + slacker fire periodically)\n"
     "• `/end_session` — stop everything\n"
     "• `/slacker` — post a manual slacker alert"
-)
-
+"""
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
@@ -224,7 +229,7 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     slots = chat_data["schedules"][name]["slots"]
-    now = datetime.now()
+    now = datetime.now(SGT)
 
     # Register jobs.
     jq = context.application.job_queue
@@ -241,7 +246,7 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     jq.run_repeating(fire_slacker, interval=slacker_sec, first=slacker_sec,
                      data={"chat_id": chat_id}, name=slacker_name, chat_id=chat_id)
 
-    midnight = datetime.combine(now.date(), time(23, 59))
+    midnight = datetime.combine(now.date(), time(23, 59), tzinfo=SGT)
     # If already past 23:59 (edge case), skip auto-end — manual /end_session still works.
     if midnight > now:
         jq.run_once(auto_end_session, when=midnight,
@@ -276,7 +281,9 @@ async def end_session(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     _cancel_jobs(jq, session["job_names"])
 
     started = datetime.fromisoformat(session["started_at_iso"])
-    now = datetime.now()
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=SGT)
+    now = datetime.now(SGT)
     dur = now - started
     dur_str = _format_duration(dur)
 
@@ -325,10 +332,6 @@ def _slacker_initial_markup(members: list[str]) -> InlineKeyboardMarkup:
     if row:
         rows.append(row)
     return InlineKeyboardMarkup(rows)
-
-
-def _slacker_called_markup() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("↩ Reset", callback_data="sl:r")]])
 
 
 async def post_slacker(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -385,8 +388,9 @@ async def _handle_slacker_cb(query, context: ContextTypes.DEFAULT_TYPE, suffix: 
 
     name = members[idx]
     caller = query.from_user.first_name or "someone"
-    text = f"😤 {name} is slacking!\nCalled out by {caller}"
-    await _safe_edit(query, text, reply_markup=_slacker_called_markup())
+    current = query.message.text or ""
+    new_text = f"{current}\n• {name} — {caller}"
+    await _safe_edit(query, new_text, reply_markup=_slacker_initial_markup(members))
 
 
 async def _handle_session_end_cb(query, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -408,7 +412,7 @@ async def fire_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     members = chat_data.get("members", [])
     slots = _current_slots(chat_data) or []
-    now = datetime.now()
+    now = datetime.now(SGT)
     upcoming = scheduler.next_upcoming_slot(slots, now)
 
     if not messages.REMINDER_TEMPLATES:
@@ -445,7 +449,7 @@ async def auto_end_session(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def restore_jobs(application) -> None:
     """Post-init hook: PicklePersistence restores chat_data but not JobQueue jobs."""
     jq = application.job_queue
-    today = datetime.now().date()
+    today = datetime.now(SGT).date()
 
     for chat_id, chat_data in list(application.chat_data.items()):
         session = chat_data.get("active_session")
@@ -476,8 +480,8 @@ async def restore_jobs(application) -> None:
         jq.run_repeating(fire_slacker, interval=slacker_sec, first=slacker_sec,
                          data={"chat_id": chat_id}, name=slacker_name, chat_id=chat_id)
 
-        midnight = datetime.combine(today, time(23, 59))
-        if midnight > datetime.now():
+        midnight = datetime.combine(today, time(23, 59), tzinfo=SGT)
+        if midnight > datetime.now(SGT):
             jq.run_once(auto_end_session, when=midnight,
                         data={"chat_id": chat_id}, name=auto_end_name, chat_id=chat_id)
 
