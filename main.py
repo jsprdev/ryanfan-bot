@@ -20,6 +20,7 @@ load_dotenv()  # reads ./.env into os.environ (no-op on hosts like Render where 
 # ---- Tune these, then restart -------------------------------------------------
 REMINDER_INTERVAL_MINUTES = 120      # how often the periodic reminder fires during a session
 SLACKER_INTERVAL_HOURS = 2          # how often the auto slacker alert fires during a session
+SLOT_WARNING_MINUTES = 10            # how many minutes before each slot to post a heads-up
 # -------------------------------------------------------------------------------
 
 
@@ -35,7 +36,7 @@ def main() -> None:
     if not token:
         raise SystemExit("BOT_TOKEN env var is required.")
 
-    handlers.configure(REMINDER_INTERVAL_MINUTES, SLACKER_INTERVAL_HOURS)
+    handlers.configure(REMINDER_INTERVAL_MINUTES, SLACKER_INTERVAL_HOURS, SLOT_WARNING_MINUTES)
 
     persistence = PicklePersistence(filepath=os.environ.get("STATE_FILE", "bot_state.pkl"))
 
@@ -59,6 +60,8 @@ def main() -> None:
     app.add_handler(CommandHandler("session", handlers.cmd_session))
     app.add_handler(CommandHandler("end_session", handlers.cmd_end_session))
     app.add_handler(CommandHandler("slacker", handlers.cmd_slacker))
+    app.add_handler(CommandHandler("slackercount", handlers.cmd_slackercount))
+    app.add_handler(CommandHandler("rollcall", handlers.cmd_rollcall))
 
     app.add_handler(CallbackQueryHandler(handlers.on_callback))
 

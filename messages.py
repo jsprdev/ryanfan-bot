@@ -14,6 +14,20 @@ REMINDER_TEMPLATES = [
     "What's up gang, it's Jeremy here. Keep on studying, I am a archi bum and I am probably still sleeping after getting drunk on the streets so you are doing a good job bro."
 ]
 
+# Placeholders: {topic}, {hh_mm}, {minutes}. Used {minutes} before each slot fires.
+SLOT_WARNING_TEMPLATES = [
+    "⏰ {topic} starts in {minutes} min (at {hh_mm}). Get ready.",
+    "📣 Heads up — {topic} at {hh_mm}, {minutes} minutes away.",
+    "🔔 {minutes}-min warning: {topic} is up next at {hh_mm}.",
+]
+
+# Placeholders: {topic}, {hh_mm}. Used at the exact start time of each slot.
+SLOT_START_TEMPLATES = [
+    "📚 {topic} starts now ({hh_mm}). Lock in.",
+    "🟢 {topic} block is live — go.",
+    "🔔 Time for {topic}.",
+]
+
 # No placeholders — plain strings used as the slacker message header.
 SLACKER_PROMPTS = [
     "😤 Who's slacking?",

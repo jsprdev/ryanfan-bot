@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -27,12 +28,16 @@ SGT = ZoneInfo("Asia/Singapore")
 # Set by bot.py before handlers run so tests can also set them directly.
 REMINDER_INTERVAL_MINUTES: float = 30
 SLACKER_INTERVAL_HOURS: float = 2
+SLOT_WARNING_MINUTES: int = 10
+ROLLCALL_STATS_DELAY_MINUTES: int = 30
+ROLLCALL_GRACE_MINUTES: int = 5
 
 
-def configure(reminder_minutes: float, slacker_hours: float) -> None:
-    global REMINDER_INTERVAL_MINUTES, SLACKER_INTERVAL_HOURS
+def configure(reminder_minutes: float, slacker_hours: float, slot_warning_minutes: int = 10) -> None:
+    global REMINDER_INTERVAL_MINUTES, SLACKER_INTERVAL_HOURS, SLOT_WARNING_MINUTES
     REMINDER_INTERVAL_MINUTES = reminder_minutes
     SLACKER_INTERVAL_HOURS = slacker_hours
+    SLOT_WARNING_MINUTES = slot_warning_minutes
 
 
 # --- small helpers -------------------------------------------------------------
@@ -246,6 +251,8 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     jq.run_repeating(fire_slacker, interval=slacker_sec, first=slacker_sec,
                      data={"chat_id": chat_id}, name=slacker_name, chat_id=chat_id)
 
+    slot_warn_names = _schedule_slot_jobs(jq, chat_id, slots, now)
+
     midnight = datetime.combine(now.date(), time(23, 59), tzinfo=SGT)
     # If already past 23:59 (edge case), skip auto-end — manual /end_session still works.
     if midnight > now:
@@ -259,7 +266,8 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "message_id": sent.message_id,
         "started_at_iso": now.isoformat(timespec="seconds"),
         "schedule_name": name,
-        "job_names": [reminder_name, slacker_name, auto_end_name],
+        "job_names": [reminder_name, slacker_name, auto_end_name, *slot_warn_names],
+        "slacker_counts": {},
     }
 
 
@@ -314,6 +322,35 @@ def _cancel_jobs(job_queue, names: list[str]) -> None:
             j.schedule_removal()
 
 
+def _schedule_slot_jobs(jq, chat_id: int, slots: list[dict], now: datetime) -> list[str]:
+    """Schedule a pre-slot warning and an at-slot start message for each future slot."""
+    names: list[str] = []
+    for i, slot in enumerate(slots):
+        slot_dt = datetime.combine(now.date(), time(slot["hour"], slot["minute"]), tzinfo=SGT)
+        hh_mm = f"{slot['hour']:02d}:{slot['minute']:02d}"
+        payload = {"chat_id": chat_id, "topic": slot["topic"], "hh_mm": hh_mm}
+
+        warn_dt = slot_dt - timedelta(minutes=SLOT_WARNING_MINUTES)
+        if warn_dt > now:
+            warn_name = f"slot_warn:{chat_id}:{i}"
+            jq.run_once(
+                fire_slot_warning, when=warn_dt,
+                data={**payload, "minutes": SLOT_WARNING_MINUTES},
+                name=warn_name, chat_id=chat_id,
+            )
+            names.append(warn_name)
+
+        if slot_dt > now:
+            start_name = f"slot_start:{chat_id}:{i}"
+            jq.run_once(
+                fire_slot_start, when=slot_dt,
+                data=payload,
+                name=start_name, chat_id=chat_id,
+            )
+            names.append(start_name)
+    return names
+
+
 # --- slacker message -----------------------------------------------------------
 
 def _slacker_initial_text() -> str:
@@ -351,6 +388,164 @@ async def cmd_slacker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await post_slacker(update.effective_chat.id, context)
 
 
+async def cmd_slackercount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    session = context.chat_data.get("active_session")
+    if not session:
+        await update.message.reply_text("No active session.")
+        return
+    members = context.chat_data.get("members", [])
+    if not members:
+        await update.message.reply_text("No members set.")
+        return
+    counts: dict[str, int] = session.get("slacker_counts", {})
+    rows = sorted(((m, counts.get(m, 0)) for m in members), key=lambda r: (-r[1], r[0]))
+    lines = ["😤 Slacker tally (this session):"] + [f"• {m} — {c}" for m, c in rows]
+    await update.message.reply_text("\n".join(lines))
+
+
+# --- rollcall ------------------------------------------------------------------
+
+_ROLLCALL_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def _rollcall_markup(members: list[str], responses: dict[str, str]) -> InlineKeyboardMarkup | None:
+    remaining = [(i, n) for i, n in enumerate(members) if n not in responses]
+    if not remaining:
+        return None
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i, name in remaining:
+        row.append(InlineKeyboardButton(name, callback_data=f"rc:{i}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def _render_rollcall_text(active: dict) -> str:
+    members: list[str] = active["members_snapshot"]
+    responses: dict[str, str] = active.get("responses", {})
+    post_dt = _parse_sgt(active["post_dt_iso"])
+    head = f"🌅 Wake up nerds, day is gonna be over alr and you have done nothing ({post_dt.strftime('%H:%M')})"
+    checked_parts: list[str] = []
+    waiting: list[str] = []
+    for name in members:
+        iso = responses.get(name)
+        if iso is None:
+            waiting.append(name)
+        else:
+            t = _parse_sgt(iso).strftime("%H:%M")
+            checked_parts.append(f"{name} ({t})")
+    lines = [head]
+    if checked_parts:
+        lines.append("✅ " + ", ".join(checked_parts))
+    if waiting:
+        lines.append("⏳ " + ", ".join(waiting))
+    return "\n".join(lines)
+
+
+def _parse_sgt(iso: str) -> datetime:
+    dt = datetime.fromisoformat(iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=SGT)
+    return dt
+
+
+async def cmd_rollcall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    arg = update.message.text.partition(" ")[2].strip()
+    m = _ROLLCALL_RE.match(arg)
+    if not m:
+        await update.message.reply_text("Usage: `/rollcall HH:MM` (24h, fires next day)", parse_mode=ParseMode.MARKDOWN)
+        return
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        await update.message.reply_text("Invalid time.")
+        return
+
+    chat_id = update.effective_chat.id
+    now = datetime.now(SGT)
+    post_dt = datetime.combine(now.date() + timedelta(days=1), time(hour, minute), tzinfo=SGT)
+
+    jq = context.application.job_queue
+    _cancel_jobs(jq, [f"rollcall_post:{chat_id}", f"rollcall_stats:{chat_id}"])
+    context.chat_data.pop("active_rollcall", None)
+
+    jq.run_once(
+        fire_rollcall_post, when=post_dt,
+        data={"chat_id": chat_id}, name=f"rollcall_post:{chat_id}", chat_id=chat_id,
+    )
+    context.chat_data["pending_rollcall"] = {"post_dt_iso": post_dt.isoformat(timespec="seconds")}
+    await update.message.reply_text(f"Rollcall set for {post_dt.strftime('%a %Y-%m-%d %H:%M')}.")
+
+
+async def fire_rollcall_post(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = context.job.data["chat_id"]
+    chat_data = context.application.chat_data[chat_id]
+    members = list(chat_data.get("members", []))
+    chat_data.pop("pending_rollcall", None)
+
+    if not members:
+        await context.bot.send_message(chat_id, "🌅 Rollcall time — but no members set. Use /setmembers.")
+        return
+
+    now = datetime.now(SGT)
+    active = {
+        "post_dt_iso": now.isoformat(timespec="seconds"),
+        "members_snapshot": members,
+        "responses": {},
+    }
+    text = _render_rollcall_text(active)
+    markup = _rollcall_markup(members, {})
+    sent = await context.bot.send_message(chat_id, text, reply_markup=markup)
+    active["message_id"] = sent.message_id
+    chat_data["active_rollcall"] = active
+
+    stats_dt = now + timedelta(minutes=ROLLCALL_STATS_DELAY_MINUTES)
+    jq = context.application.job_queue
+    jq.run_once(
+        fire_rollcall_stats, when=stats_dt,
+        data={"chat_id": chat_id}, name=f"rollcall_stats:{chat_id}", chat_id=chat_id,
+    )
+
+
+async def fire_rollcall_stats(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = context.job.data["chat_id"]
+    chat_data = context.application.chat_data[chat_id]
+    active = chat_data.get("active_rollcall")
+    if not active:
+        return
+
+    post_dt = _parse_sgt(active["post_dt_iso"])
+    members: list[str] = active.get("members_snapshot", [])
+    responses: dict[str, str] = active.get("responses", {})
+    grace = ROLLCALL_GRACE_MINUTES
+
+    lines = [f"📊 Rollcall stats ({post_dt.strftime('%H:%M')} post, {grace} min grace)"]
+    for name in members:
+        iso = responses.get(name)
+        if iso is None:
+            lines.append(f"• {name} — did not respond")
+            continue
+        delay_min = (_parse_sgt(iso) - post_dt).total_seconds() / 60
+        if delay_min <= grace:
+            lines.append(f"• {name} — on time")
+        else:
+            lines.append(f"• {name} — {int(round(delay_min))} min late")
+
+    await context.bot.send_message(chat_id, "\n".join(lines))
+
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=chat_id, message_id=active["message_id"], reply_markup=None,
+        )
+    except BadRequest:
+        pass
+
+    chat_data.pop("active_rollcall", None)
+
+
 # --- callback dispatcher -------------------------------------------------------
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -360,10 +555,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = query.data or ""
     if data.startswith("sl:"):
         await _handle_slacker_cb(query, context, data[3:])
+    elif data.startswith("rc:"):
+        await _handle_rollcall_cb(query, context, data[3:])
     elif data == "se:end":
         await _handle_session_end_cb(query, context)
     else:
         log.warning("Unknown callback data: %r", data)
+
+
+async def _handle_rollcall_cb(query, context: ContextTypes.DEFAULT_TYPE, suffix: str) -> None:
+    active = context.chat_data.get("active_rollcall")
+    if not active:
+        await _safe_edit(query, "🌅 Rollcall closed.")
+        return
+    members: list[str] = active.get("members_snapshot", [])
+    try:
+        idx = int(suffix)
+    except ValueError:
+        return
+    if not (0 <= idx < len(members)):
+        return
+    name = members[idx]
+    responses = active.setdefault("responses", {})
+    if name in responses:
+        return  # already checked in; silent
+    responses[name] = datetime.now(SGT).isoformat(timespec="seconds")
+    await _safe_edit(query, _render_rollcall_text(active), reply_markup=_rollcall_markup(members, responses))
 
 
 async def _handle_slacker_cb(query, context: ContextTypes.DEFAULT_TYPE, suffix: str) -> None:
@@ -388,8 +605,12 @@ async def _handle_slacker_cb(query, context: ContextTypes.DEFAULT_TYPE, suffix: 
 
     name = members[idx]
     caller = query.from_user.first_name or "someone"
+    session = chat_data.get("active_session")
+    if session is not None:
+        counts = session.setdefault("slacker_counts", {})
+        counts[name] = counts.get(name, 0) + 1
     current = query.message.text or ""
-    new_text = f"{current}\n• {name} — {caller}"
+    new_text = f"{current}\n{name} slacker - {caller}"
     await _safe_edit(query, new_text, reply_markup=_slacker_initial_markup(members))
 
 
@@ -428,6 +649,36 @@ async def fire_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot.send_message(chat_id, text)
 
 
+async def fire_slot_warning(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data
+    chat_id = data["chat_id"]
+    chat_data = context.application.chat_data[chat_id]
+    if not chat_data.get("active_session"):
+        return
+    if not messages.SLOT_WARNING_TEMPLATES:
+        return
+    template = random.choice(messages.SLOT_WARNING_TEMPLATES)
+    text = template.format(topic=data["topic"], hh_mm=data["hh_mm"], minutes=data["minutes"]).strip()
+    if not text:
+        return
+    await context.bot.send_message(chat_id, text)
+
+
+async def fire_slot_start(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data
+    chat_id = data["chat_id"]
+    chat_data = context.application.chat_data[chat_id]
+    if not chat_data.get("active_session"):
+        return
+    if not messages.SLOT_START_TEMPLATES:
+        return
+    template = random.choice(messages.SLOT_START_TEMPLATES)
+    text = template.format(topic=data["topic"], hh_mm=data["hh_mm"]).strip()
+    if not text:
+        return
+    await context.bot.send_message(chat_id, text)
+
+
 async def fire_slacker(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.data["chat_id"]
     chat_data = context.application.chat_data[chat_id]
@@ -452,38 +703,82 @@ async def restore_jobs(application) -> None:
     today = datetime.now(SGT).date()
 
     for chat_id, chat_data in list(application.chat_data.items()):
-        session = chat_data.get("active_session")
-        if not session:
-            continue
+        _restore_session_jobs(jq, chat_id, chat_data, today)
+        _restore_rollcall_jobs(jq, chat_id, chat_data)
 
+
+def _restore_session_jobs(jq, chat_id: int, chat_data: dict, today) -> None:
+    session = chat_data.get("active_session")
+    if not session:
+        return
+
+    try:
+        started = datetime.fromisoformat(session["started_at_iso"])
+    except (KeyError, ValueError):
+        del chat_data["active_session"]
+        return
+
+    if started.date() != today:
+        log.info("Clearing stale session in chat %s (started %s)", chat_id, started)
+        del chat_data["active_session"]
+        return
+
+    reminder_name = f"reminder:{chat_id}"
+    slacker_name = f"slacker:{chat_id}"
+    auto_end_name = f"auto_end:{chat_id}"
+
+    reminder_sec = REMINDER_INTERVAL_MINUTES * 60
+    slacker_sec = SLACKER_INTERVAL_HOURS * 3600
+
+    jq.run_repeating(fire_reminder, interval=reminder_sec, first=reminder_sec,
+                     data={"chat_id": chat_id}, name=reminder_name, chat_id=chat_id)
+    jq.run_repeating(fire_slacker, interval=slacker_sec, first=slacker_sec,
+                     data={"chat_id": chat_id}, name=slacker_name, chat_id=chat_id)
+
+    now = datetime.now(SGT)
+    sched_name = session.get("schedule_name")
+    slots = chat_data.get("schedules", {}).get(sched_name, {}).get("slots", [])
+    slot_warn_names = _schedule_slot_jobs(jq, chat_id, slots, now)
+
+    midnight = datetime.combine(today, time(23, 59), tzinfo=SGT)
+    if midnight > now:
+        jq.run_once(auto_end_session, when=midnight,
+                    data={"chat_id": chat_id}, name=auto_end_name, chat_id=chat_id)
+
+    session["job_names"] = [reminder_name, slacker_name, auto_end_name, *slot_warn_names]
+    log.info("Restored session jobs for chat %s", chat_id)
+
+
+def _restore_rollcall_jobs(jq, chat_id: int, chat_data: dict) -> None:
+    now = datetime.now(SGT)
+
+    pending = chat_data.get("pending_rollcall")
+    if pending:
         try:
-            started = datetime.fromisoformat(session["started_at_iso"])
+            post_dt = _parse_sgt(pending["post_dt_iso"])
         except (KeyError, ValueError):
-            del chat_data["active_session"]
-            continue
+            del chat_data["pending_rollcall"]
+        else:
+            if post_dt > now:
+                jq.run_once(
+                    fire_rollcall_post, when=post_dt,
+                    data={"chat_id": chat_id}, name=f"rollcall_post:{chat_id}", chat_id=chat_id,
+                )
+                log.info("Restored pending rollcall for chat %s at %s", chat_id, post_dt)
+            else:
+                del chat_data["pending_rollcall"]
 
-        if started.date() != today:
-            # Stale session from a prior day — clear it silently.
-            log.info("Clearing stale session in chat %s (started %s)", chat_id, started)
-            del chat_data["active_session"]
-            continue
-
-        reminder_name = f"reminder:{chat_id}"
-        slacker_name = f"slacker:{chat_id}"
-        auto_end_name = f"auto_end:{chat_id}"
-
-        reminder_sec = REMINDER_INTERVAL_MINUTES * 60
-        slacker_sec = SLACKER_INTERVAL_HOURS * 3600
-
-        jq.run_repeating(fire_reminder, interval=reminder_sec, first=reminder_sec,
-                         data={"chat_id": chat_id}, name=reminder_name, chat_id=chat_id)
-        jq.run_repeating(fire_slacker, interval=slacker_sec, first=slacker_sec,
-                         data={"chat_id": chat_id}, name=slacker_name, chat_id=chat_id)
-
-        midnight = datetime.combine(today, time(23, 59), tzinfo=SGT)
-        if midnight > datetime.now(SGT):
-            jq.run_once(auto_end_session, when=midnight,
-                        data={"chat_id": chat_id}, name=auto_end_name, chat_id=chat_id)
-
-        session["job_names"] = [reminder_name, slacker_name, auto_end_name]
-        log.info("Restored session jobs for chat %s", chat_id)
+    active = chat_data.get("active_rollcall")
+    if active:
+        try:
+            post_dt = _parse_sgt(active["post_dt_iso"])
+        except (KeyError, ValueError):
+            del chat_data["active_rollcall"]
+            return
+        stats_dt = post_dt + timedelta(minutes=ROLLCALL_STATS_DELAY_MINUTES)
+        fire_at = stats_dt if stats_dt > now else now + timedelta(seconds=2)
+        jq.run_once(
+            fire_rollcall_stats, when=fire_at,
+            data={"chat_id": chat_id}, name=f"rollcall_stats:{chat_id}", chat_id=chat_id,
+        )
+        log.info("Restored active rollcall stats job for chat %s at %s", chat_id, fire_at)
